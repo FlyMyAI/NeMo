@@ -35,6 +35,8 @@ from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
+import onnxruntime
+import numpy as np
 
 
 class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
@@ -134,6 +136,14 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
 
         # setting the RNNT decoder as the default one
         self.cur_decoder = "rnnt"
+
+        # enable ONNX-based encoder inference.
+        self._use_onnx_encoder = True
+        self._encoder_onnx_session = onnxruntime.InferenceSession(
+            "/home/ubuntu/fma/nemo/encoder-parakeet.onnx",  # Hardcode with ONNX encoder path
+            providers=["CPUExecutionProvider"],
+        )
+        # ----------------------------------------------------------------
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
 
@@ -638,3 +648,52 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
         results.append(model)
 
         return results
+
+    def forward(
+            self,
+            input_signal: Optional[torch.Tensor] = None,
+            input_signal_length: Optional[torch.Tensor] = None,
+            processed_signal: Optional[torch.Tensor] = None,
+            processed_signal_length: Optional[torch.Tensor] = None,
+    ):
+        """
+        Override the parent's forward method so that if `self._use_onnx_encoder` is True (and we are not training),
+        the encoder forward pass is done via onnxruntime. Otherwise, it falls back to the original PyTorch forward.
+        """
+
+        if self.training or not self._use_onnx_encoder:
+            return super().forward(
+                input_signal=input_signal,
+                input_signal_length=input_signal_length,
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+            )
+
+        has_input_signal = input_signal is not None and input_signal_length is not None
+        has_processed_signal = processed_signal is not None and processed_signal_length is not None
+
+        if (has_input_signal ^ has_processed_signal) is False:
+            raise ValueError(
+                "Provide either (input_signal, input_signal_length) or (processed_signal, processed_signal_length).")
+
+        if not has_processed_signal:
+            processed_signal, processed_signal_length = self.preprocessor(
+                input_signal=input_signal, length=input_signal_length
+            )
+
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(
+                input_spec=processed_signal, length=processed_signal_length
+            )
+        sig_np = processed_signal.detach().cpu().float().numpy()
+        len_np = processed_signal_length.detach().cpu().long().numpy()
+        ort_inputs = {
+            "audio_signal": sig_np,
+            "length": len_np,
+        }
+        ort_outs = self._encoder_onnx_session.run(None, ort_inputs)
+        encoded_onnx = ort_outs[0]
+        encoded_len_onnx = ort_outs[1]
+        encoded_torch = torch.from_numpy(encoded_onnx).to(processed_signal.device)
+        encoded_len_torch = torch.from_numpy(encoded_len_onnx).to(processed_signal_length.device)
+        return encoded_torch, encoded_len_torch
