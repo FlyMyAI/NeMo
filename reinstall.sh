@@ -28,13 +28,13 @@ fi
 
 echo 'Installing nemo'
 if [[ "$INSTALL_OPTION" == "dev" ]]; then
-    ${PIP} install --editable ".[all]"
+    ${PIP} install --editable ".[asr]"
 else
     rm -rf dist/
     ${PIP} install build pytest-runner
     python -m build --no-isolation --wheel
     DIST_FILE=$(find ./dist -name "*.whl" | head -n 1)
-    ${PIP} install "${DIST_FILE}[all]"
+    ${PIP} install "${DIST_FILE}[asr]"
 fi
 
 echo 'All done!'
